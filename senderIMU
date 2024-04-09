@@ -1,0 +1,197 @@
+#include <Wire.h>
+#include <esp_now.h>
+#include <WiFi.h>
+
+const int MPU9250_ADDR = 0x68; // MPU9250 default I2C address
+const float RAD_TO_DEG_CUSTOM = 57.2957795131; // Custom conversion factor from radians to degrees
+
+//----- WIFI----
+uint8_t broadcastAddress[] = {0x78, 0x21, 0x84, 0x8D, 0x3E, 0x20}; //Added
+// Structure example to send data
+// Must match the receiver structure
+typedef struct struct_message {
+  float roll;
+  float pitch;
+  
+} struct_message;
+
+// Create a struct_message called myData
+struct_message myData;
+
+esp_now_peer_info_t peerInfo;
+
+// callback when data is sent
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  Serial.print("\r\nLast Packet Send Status:\t");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
+}
+//------
+
+// Define constant offsets for roll and pitch angles
+float rollOffset = 0.0;
+float pitchOffset = 0.0;
+
+void setup() {
+  Wire.begin();
+  Serial.begin(115200);
+  while (!Serial);
+
+  // Initialize MPU9250
+  Wire.beginTransmission(MPU9250_ADDR);
+  Wire.write(0x6B); // PWR_MGMT_1 register
+  Wire.write(0);    // Wake up MPU9250
+  Wire.endTransmission(true);
+
+  // Calibrate roll and pitch offsets
+  calibrate();
+
+  //----WIFI added
+  // Init Serial Monitor
+  Serial.begin(115200);
+
+ 
+  // Set device as a Wi-Fi Station
+  WiFi.mode(WIFI_STA);
+
+  // Init ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    return;
+  }
+
+  // Once ESPNow is successfully Init, we will register for Send CB to
+  // get the status of Trasnmitted packet
+  esp_now_register_send_cb(OnDataSent);
+  
+  // Register peer
+  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+  peerInfo.channel = 0;  
+  peerInfo.encrypt = false;
+  
+  // Add peer        
+  if (esp_now_add_peer(&peerInfo) != ESP_OK){
+    Serial.println("Failed to add peer");
+    return;
+  }
+}
+
+void loop() {
+  // Read accelerometer and gyroscope data
+  int16_t accel[3];
+  int16_t gyro[3];
+  readSensor(MPU9250_ADDR, 0x3B, accel, 3);
+  readSensor(MPU9250_ADDR, 0x43, gyro, 3);
+
+  // Convert raw data to meaningful units
+  float accelX = accel[0] / 16384.0; // 16384 LSB/g
+  float accelY = accel[1] / 16384.0;
+  float accelZ = accel[2] / 16384.0;
+  float gyroX = gyro[0] / 131.0; // 131 LSB/(deg/s)
+  float gyroY = gyro[1] / 131.0;
+
+  // Calculate roll and pitch angles using accelerometer data
+  float roll = atan2(accelY, sqrt(accelX * accelX + accelZ * accelZ)) * RAD_TO_DEG_CUSTOM - rollOffset;
+  float pitch = atan2(-accelX, sqrt(accelY * accelY + accelZ * accelZ)) * RAD_TO_DEG_CUSTOM - pitchOffset;
+
+  // Calculate the change in angles using gyroscope data
+  float dt = 0.1; // Sample time in seconds
+  float rollRate = gyroX;
+  float pitchRate = gyroY;
+
+  // Integrate gyroscope data to update roll and pitch angles using a complementary filter
+  roll = 0.98 * (roll + rollRate * dt) + 0.02 * roll;
+  pitch = 0.98 * (pitch + pitchRate * dt) + 0.02 * pitch;
+  if (roll < 0) {
+  roll = map(roll, -77, 0, -90, 0);
+} else {
+  roll = map(roll, 0, 91, 0, 90);
+}
+  if (pitch < 0) {
+  pitch = map(pitch, -85, 0, -90, 0);
+} else {
+  pitch = map(pitch, 0, 80, 0, 90);
+}
+  // Print roll and pitch angles
+  Serial.print("Roll: ");
+  Serial.print(roll);
+  Serial.print("\tPitch: ");
+  Serial.println(pitch);
+  
+  sendData(roll,pitch);
+
+
+  delay(1000);
+}
+
+void calibrate() {
+  Serial.println("Calibrating...");
+  delay(1000); // Delay to stabilize readings
+  
+  float rollSum = 0.0;
+  float pitchSum = 0.0;
+
+  for (int i = 0; i < 6000; i++) {
+    // Read accelerometer data
+    int16_t accel[3];
+    readSensor(MPU9250_ADDR, 0x3B, accel, 3);
+
+    // Convert raw data to meaningful units
+    float accelX = accel[0] / 16384.0; // 16384 LSB/g
+    float accelY = accel[1] / 16384.0;
+    float accelZ = accel[2] / 16384.0;
+
+    // Calculate roll and pitch angles
+    float roll = atan2(accelY, sqrt(accelX * accelX + accelZ * accelZ)) * RAD_TO_DEG_CUSTOM;
+    float pitch = atan2(-accelX, sqrt(accelY * accelY + accelZ * accelZ)) * RAD_TO_DEG_CUSTOM;
+
+    // Accumulate roll and pitch readings
+    rollSum += roll;
+    pitchSum += pitch;
+    
+    delay(1); // Small delay between readings
+  }
+
+  // Calculate average roll and pitch offsets
+  rollOffset = rollSum / 6000.0;
+  pitchOffset = pitchSum / 6000.0;
+
+  Serial.print("Calibration complete. Roll Offset: ");
+  Serial.print(rollOffset);
+  Serial.print(", Pitch Offset: ");
+  Serial.println(pitchOffset);
+}
+
+void readSensor(int addr, byte reg, int16_t* data, int len) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+
+  Wire.requestFrom(addr, len * 2, true);
+  for (int i = 0; i < len; i++) {
+    data[i] = (Wire.read() << 8) | Wire.read();
+  }
+}
+
+void sendData(float roll, float pitch)
+{
+  // Set values to send
+  myData.roll = roll;
+  myData.pitch = pitch;
+  
+  
+  // Send message via ESP-NOW
+  esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *) &myData, sizeof(myData));
+   
+  if (result == ESP_OK) {
+    Serial.println("Sent with success");
+    Serial.print("Roll: ");
+    Serial.println(myData.roll);
+    Serial.print("Pitch: ");
+    Serial.println(myData.pitch);
+    
+  }
+  else {
+    Serial.println("Error sending the data");
+  }
+  delay(20);
+}
